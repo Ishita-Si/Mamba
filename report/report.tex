@@ -1,113 +1,117 @@
 \documentclass[10pt,twocolumn]{article}
 \usepackage[top=0.9in,bottom=0.9in,left=0.75in,right=0.75in,columnsep=0.3in]{geometry}
 \usepackage{graphicx,amsmath,amssymb,booktabs,cite,times}
-\setlength{\parindent}{1em}\linespread{1.12}
+\setlength{\parindent}{1em}\linespread{1.1}
 \begin{document}
-\title{\vspace{-1em}\large\bfseries Reduced-Scale Reproduction of Mamba: Selective State Spaces for Sequence Modeling\vspace{-0.5em}}
-\author{\small Deep Learning 2026 --- Paper Implementation Project (DL-061)}
+\title{\vspace{-1em}\large\bfseries Reproducing Mamba at Small Scale: Selective State Spaces versus Time-Invariant SSMs and Transformers\vspace{-0.5em}}
+\author{\small Deep Learning 2026 --- Paper Implementation Project (DL-061)\\ \small [Your name, roll number]}
 \date{}
 \maketitle\vspace{-1.5em}
 
 \begin{abstract}
-\small We re-implement the selective state-space block of Mamba \cite{gu2023mamba} in pure PyTorch and test its core claim at small scale: making the SSM parameters input-dependent enables content-based selection. On a selective-copying task, Mamba reaches 98.6\% sequence accuracy while the input-independent (LTI) ablation reaches 6.2\%. On a character-level language model, the differences are small at our scale and the LTI variant is marginally better, which we report as a negative result.
+\small We re-implement the selective state-space (S6) block of Mamba \cite{gu2023mamba} in pure PyTorch and test its central claim at small scale on a Colab T4 GPU. On a synthetic selective-copying task, the selective model reaches 82.2\% sequence accuracy while an otherwise identical input-independent (LTI) model reaches 0\%; a parameter-matched Transformer reaches 100\% at this short sequence length. On a TinyShakespeare character-level language model (about 475K parameters), the selective and LTI models are indistinguishable (2.383 vs.\ 2.385 bits/char), and both beat the parameter-matched Transformer (2.514). All results are from a single seed. We therefore claim only that selection is necessary for selective copying in our setting, and that we could not show a benefit of selection on language modeling at this scale.
 \end{abstract}
 
 \section{Problem and Motivation}
-Transformers model sequences with $O(L^2)$ attention; linear-time alternatives such as S4 use linear time-invariant (LTI) state-space models, which can be computed as convolutions but cannot select information based on content. Mamba makes the SSM parameters functions of the input and recovers efficiency with a hardware-aware scan.
+Transformers model sequences with $O(L^2)$ attention. Linear-time alternatives based on structured state-space models (SSMs) such as S4 \cite{s4} are linear time-invariant (LTI): the same dynamics apply at every position, so they cannot decide what to remember based on content. Mamba makes the SSM parameters functions of the input and recovers efficiency with a hardware-aware scan. We ask: (i) does selectivity matter on a task designed to need it; (ii) does it help on language modeling at small scale; (iii) how does Mamba compare with a Transformer of equal parameter count?
 
+\section{Background and Method}
+A continuous SSM $h'(t)=Ah(t)+Bx(t),\ y(t)=Ch(t)$ is discretised with step size $\Delta$. Assuming $x$ is constant over each step (zero-order hold), the exact solution gives
+\begin{equation}
+\bar A=e^{\Delta A},\qquad \bar B=(\Delta A)^{-1}\!\left(e^{\Delta A}-I\right)\Delta B\approx\Delta B,
+\end{equation}
+where the approximation is the Euler form used in practice (accurate for small $\Delta$). The recurrence is
+\begin{equation}
+h_t=\bar A_t h_{t-1}+\bar B_t x_t,\qquad y_t=C_t h_t+Dx_t .
+\end{equation}
+With $A$ diagonal and negative, $\bar A\in(0,1)$ element-wise, so the state decays and the update is stable. In an LTI model $(\Delta,B,C)$ are constants, so the model equals a global convolution. In S6 they are \emph{selective}: $\Delta_t=\mathrm{softplus}(\mathrm{Lin}(x_t))$, $B_t=\mathrm{Lin}_B(x_t)$, $C_t=\mathrm{Lin}_C(x_t)$. Intuitively, $B_t$ decides what to write, $C_t$ what to read, and $\Delta_t$ how strongly the current input replaces the state (large $\Delta$: reset to the current input; small $\Delta$: ignore it). Selectivity breaks the convolutional view, but the recurrence stays associative under
+\begin{equation}
+(a_1,b_1)\circ(a_2,b_2)=(a_1a_2,\;a_2b_1+b_2),
+\label{eq:assoc}
+\end{equation}
+so it can be computed by a parallel prefix scan. Costs: attention is $O(L^2D)$ in time; the SSM is $O(LDN)$ in time with $O(DN)$ state at inference.
 
-\section{Background}
-\subsection{State-space models and S4}
-A structured SSM maps a 1-D input $x(t)$ to $y(t)$ through a latent state $h(t)\in\mathbb R^N$ via $h'(t)=Ah(t)+Bx(t)$, $y(t)=Ch(t)$. For discrete data the continuous parameters $(\Delta,A,B)$ are converted to $(\bar A,\bar B)$. Because $(\bar A,\bar B,C)$ are constant over time (LTI), the whole model equals a global convolution $y=x*\bar K$ with $\bar K=(C\bar B,C\bar A\bar B,\dots,C\bar A^{k}\bar B,\dots)$, enabling parallel training in $O(L\log L)$ via FFT and $O(1)$-per-step recurrent inference. The price is that every position is treated identically: the model cannot choose to remember one token and ignore another based on what the tokens are.
-\subsection{Why selection matters}
-Two synthetic tasks illustrate the limitation. In \emph{selective copying}, data tokens are scattered at random positions among noise tokens and must be reproduced in order after a marker; a fixed convolution kernel cannot know where the data tokens are. Mamba's remedy is to make $\Delta,B,C$ functions of $x_t$. Intuitively, $B_t$ decides what to write into the state, $C_t$ what to read, and $\Delta_t$ how long to retain it.
 
 \subsection{Derivation of the discretisation}
-For $h'=Ah+Bx$ with $x$ held constant over $[t,t+\Delta]$, the variation-of-constants formula gives $h(t{+}\Delta)=e^{\Delta A}h(t)+\int_0^{\Delta}e^{(\Delta-s)A}B\,ds\,x=e^{\Delta A}h(t)+A^{-1}(e^{\Delta A}-I)B\,x$. Hence $\bar A=e^{\Delta A}$ and $\bar B=(\Delta A)^{-1}(e^{\Delta A}-I)\cdot\Delta B$. For small $\Delta A$, $(\Delta A)^{-1}(e^{\Delta A}-I)\to I$, so $\bar B\approx\Delta B$ (the Euler form used in practice and in our code). With $A$ negative real, $\bar A\in(0,1)$ and the recurrence is stable.
-
-\subsection{Complexity}
-Attention costs $O(L^2D)$ time and (without caching) $O(L^2)$ memory; a recurrent SSM costs $O(LDN)$ time and $O(DN)$ state at inference, independent of context length. The sequential recurrence is hard to parallelise on GPUs; Mamba's fused kernel keeps the expanded state $(B,L,D,N)$ in SRAM. Our parallel scan instead materialises that tensor in memory, which is why we scaled the experiments down.
-\section{Method}
-A continuous SSM $h'(t)=Ah(t)+Bx(t),\ y(t)=Ch(t)$ is discretised with step $\Delta$ (zero-order hold):
+For $h'=Ah+Bx$ with $x$ held constant over $[t,t{+}\Delta]$, the variation-of-constants formula gives
 \begin{equation}
-\bar A=\exp(\Delta A),\quad \bar B=(\Delta A)^{-1}(\exp(\Delta A)-I)\,\Delta B\approx\Delta B,
+h(t{+}\Delta)=e^{\Delta A}h(t)+\int_0^{\Delta}e^{(\Delta-s)A}B\,ds\;x
+=e^{\Delta A}h(t)+A^{-1}\!\left(e^{\Delta A}-I\right)B\,x .
 \end{equation}
-\begin{equation}
-h_t=\bar A_t h_{t-1}+\bar B_t x_t,\qquad y_t=C_t h_t+Dx_t.
-\end{equation}
-In S6 the parameters are \emph{selective}: $\Delta_t=\mathrm{softplus}(\mathrm{Linear}(x_t))$, $B_t=\mathrm{Linear}_B(x_t)$, $C_t=\mathrm{Linear}_C(x_t)$, with $A=-\exp(A_{\log})$ initialised S4D-real ($A=-(1..N)$). A large $\Delta_t$ resets the state toward the current input; a small $\Delta_t$ ignores it, which acts as a learned gate. Since the system is no longer LTI, the convolutional form is lost, but the recurrence is associative under $(a_1,b_1)\circ(a_2,b_2)=(a_1a_2,\,a_2b_1+b_2)$, so it can be evaluated by a parallel scan.
+Hence $\bar A=e^{\Delta A}$ and $\bar B=A^{-1}(e^{\Delta A}-I)B=(\Delta A)^{-1}(e^{\Delta A}-I)\,\Delta B$. For small $\Delta A$, $(\Delta A)^{-1}(e^{\Delta A}-I)\to I$, so $\bar B\approx\Delta B$. The notebook compares the two for $A=-(1,2,3)$: at $\Delta{=}0.01$ they agree to within 1\%, at $\Delta{=}0.1$ they differ by about 5--14\%, and at $\Delta{=}1$ they differ substantially ($\bar B=0.63$ vs.\ $1.0$ for the first state dimension). Since $\Delta$ is initialised in $[10^{-3},10^{-1}]$ and learned, we use the cheaper Euler form as the paper does.
 
+\subsection{Why the recurrence is parallelisable}
+Write the update as an affine map $h\mapsto a\,h+b$. Composing two such maps gives $h\mapsto a_2(a_1h+b_1)+b_2=(a_1a_2)h+(a_2b_1+b_2)$, which is Eq.~\eqref{eq:assoc}. Because this composition is associative, all prefixes $h_1,\dots,h_L$ can be computed by a parallel scan with depth $O(\log L)$ instead of $L$ sequential steps. Selectivity makes $a_t=\bar A_t$ and $b_t=\bar B_tx_t$ depend on the input, but they are still known for all $t$ before the scan starts, so associativity is all that is needed.
 \section{Implementation}
-All code is in the repository (PyTorch). A block applies \texttt{in\_proj} to get $(x,z)$ of width $2D$ (expand 2), a causal depthwise conv (kernel 4) and SiLU on $x$, the selective SSM, gating by $\mathrm{SiLU}(z)$, and \texttt{out\_proj}; blocks are stacked with RMSNorm and residuals and a tied embedding/head. We implement both a sequential reference scan and a Hillis--Steele parallel scan; unit tests confirm they agree (max error $\approx10^{-6}$) and that the block is causal. There is no fused CUDA kernel, so wall-clock times are not comparable to the paper. The LTI ablation replaces $\Delta,B,C$ by input-independent learned parameters. The Transformer baseline is a causal pre-norm model with learned positions; we report a 4$\times$-MLP version and a parameter-matched version (2$\times$ MLP).
+All code was written for this project in PyTorch (notebook \texttt{Mamba\_from\_scratch.ipynb}). \textbf{Block:} \texttt{in\_proj} produces $(x,z)$ of width $2D_{\text{in}}$ (expand 2); $x$ passes through a causal depthwise convolution (kernel 4, left padding $k{-}1$, cropped to length $L$) and SiLU; $(\Delta,B,C)$ come from \texttt{x\_proj} and \texttt{dt\_proj} (low-rank, rank $\lceil d/16\rceil$); the scan output is gated by $\mathrm{SiLU}(z)$ and projected by \texttt{out\_proj}. $A=-\exp(A_{\log})$ is initialised S4D-real ($A=-(1,\dots,N)$) and $\Delta$ such that $\mathrm{softplus}(\text{bias})$ is log-uniform in $[10^{-3},10^{-1}]$, as in the paper.
+
+\textbf{Scan:} we implement a sequential reference scan (Python loop) and a Hillis--Steele parallel scan using Eq.~\eqref{eq:assoc}: in round $k$ every position combines with the one $2^k$ steps earlier, so $h_{1:L}$ is obtained in $\lceil\log_2L\rceil$ rounds. The parallel scan materialises tensors of shape $(B,L,D_{\text{in}},N)$, so it is far less memory-efficient than the paper's fused CUDA kernel. Two unit tests are in the notebook: the two scans agree (max abs.\ difference $9.5{\times}10^{-7}$), and the block is causal (perturbing inputs at positions $\ge10$ leaves outputs before position 10 unchanged).
 
 
+\begin{figure}[h]\small\centering\fbox{\parbox{0.94\columnwidth}{\textbf{Algorithm 1: selective scan} (batch $b$, length $l$, channels $d$, state $n$).\\
+\textbf{Input:} $u,\Delta\in\mathbb R^{b\times l\times d}$, $A\in\mathbb R^{d\times n}$, $B,C\in\mathbb R^{b\times l\times n}$, $D\in\mathbb R^{d}$\\
+1. $\bar A\leftarrow\exp(\Delta\otimes A)$ \hfill $(b,l,d,n)$\\
+2. $\bar Bu\leftarrow\Delta\otimes B\otimes u$ \hfill $(b,l,d,n)$\\
+3. \emph{sequential:} for $t=1..l$: $h\leftarrow\bar A_t\odot h+\bar Bu_t$;\ $y_t\leftarrow\sum_n C_{t,n}h_{\cdot,n}$\\
+\hspace{0.9em}\emph{parallel:} for $o=1,2,4,\dots<l$: $\;x_t\leftarrow\bar A_t\odot x_{t-o}+x_t$,\ $\bar A_t\leftarrow\bar A_t\odot\bar A_{t-o}$ (positions $t\le o$ unchanged); then $y_t\leftarrow\sum_nC_{t,n}x_{t,\cdot,n}$\\
+4. \textbf{return} $y+D\odot u$}}\label{alg:scan}\end{figure}
+\textbf{Design choices.} Weight decay is applied to all parameters for simplicity (the official code exempts $A_{\log}$ and $D$), a small deviation from the reference implementation. We use RMSNorm before each mixer, residual connections, and tie the embedding and output head. The Transformer baseline uses learned absolute positions of the same width as the model; its attention uses a boolean causal mask. Data for both tasks is generated on the fly from fixed seeds, and evaluation uses a fixed held-out generator (selective copy: 512 fresh sequences; LM: 20 validation batches).
+\textbf{Models.} Both architectures share one wrapper: embedding, $n$ layers of (RMSNorm $\to$ mixer $\to$ residual), final RMSNorm, and a weight-tied output head. The mixer is either the Mamba block or a causal pre-norm Transformer block (4 heads, GELU MLP, learned absolute positions). \textbf{LTI ablation:} $\Delta$, $B$, $C$ are replaced by input-independent learned parameters ($\Delta$ per channel, $B,C\in\mathbb R^N$ shared), with the same initialisation of $\Delta$ and $A$; all else is unchanged.
 
-\subsection{The scan}
-Algorithm~\ref{alg:scan} summarises the computation for input $u\in\mathbb R^{B\times L\times D}$.
-\begin{figure}[h]\small\centering\fbox{\parbox{0.93\columnwidth}{\textbf{Algorithm 1: selective scan.}\\
-1. $\bar A\leftarrow\exp(\Delta\otimes A)$ \hfill $(B,L,D,N)$\\
-2. $\bar Bu\leftarrow\Delta\otimes B_t\otimes u$ \hfill $(B,L,D,N)$\\
-3. \textbf{sequential:} for $t=1..L$: $h\leftarrow\bar A_t h+\bar Bu_t$; $y_t\leftarrow\sum_n C_{t,n}h_{\cdot,n}$\\
-\hspace{1.2em}\textbf{parallel:} for $o=1,2,4,\dots<L$: $x_t\leftarrow\bar A_t x_{t-o}+x_t$, $\bar A_t\leftarrow\bar A_t\bar A_{t-o}$ (shifted, padded with $(1,0)$)\\
-4. $y\leftarrow y+Du$}}\label{alg:scan}\end{figure}
-The parallel version is a Hillis--Steele inclusive scan of the associative operator in Sec.~III; after $\lceil\log_2L\rceil$ rounds $x_t=h_t$. Verifying equivalence against the sequential loop is the first unit test, and the causality test checks that perturbing inputs at positions $\ge10$ leaves outputs at positions $<10$ unchanged, which guards against off-by-one errors in the causal convolution (padding $k{-}1$, then truncating to $L$).
-\subsection{Design choices}
-Following the paper we initialise $\Delta$ so that $\mathrm{softplus}(\text{bias})\in[10^{-3},10^{-1}]$ (log-uniform) and use $A=-\exp(A_{\log})$ with $A_{\log}$ initialised to $\log(1..N)$ so that the real parts are negative and the state decays. We use RMSNorm before each mixer, residual connections, and weight tying between the embedding and head. Weight decay is applied to all parameters for simplicity (the official code exempts $A_{\log}$ and $D$), which is a small deviation. The LTI ablation keeps the same initialisation of $\Delta$ and $A$ and learns fixed $B,C\in\mathbb R^{N}$ shared across channels and time.
-\subsection{Hyperparameters}
-\begin{table}[h]\centering\small\caption{Training configuration (reduced scale).}
+\textbf{Equal size.} ``Equal size'' means equal total parameter count. The Transformer has the same width and depth as Mamba, and its MLP width $d_{\text{ff}}$ is chosen so that its total parameters match the selective Mamba model (parameters are linear in $d_{\text{ff}}$): $d_{\text{ff}}=105$ for copying and $179$ for the LM. The LTI ablation is \emph{not} size-matched: it has about 15\% (copy) and 10\% (LM) fewer parameters because it has no \texttt{x\_proj}.
+
+\section{Experimental Setup}
+\textbf{Tasks.} \emph{Selective copying}: $K{=}8$ data tokens (vocabulary 8) are placed at random positions among noise tokens (token 0) in a window of $L{=}64$, followed by $K$ recall markers; the target at the marker positions is the data tokens in order. Loss and accuracy are measured on those $K$ positions; \emph{sequence accuracy} requires all $K$ correct, \emph{token accuracy} is per token (chance level is $1/8$). \emph{Character LM}: TinyShakespeare (1.12M characters, vocabulary 65), 90/10 train/validation split, context 128; the metric is validation bits per character (cross-entropy in nats divided by $\ln2$).
+
+\textbf{Changes from the paper.} The paper evaluates selective copying at $L{=}4096$ with 16 tokens and trains much larger language models on large corpora. We use $L{=}64$, $K{=}8$, two-layer models, and a 475K-parameter LM trained for 4000 steps, so that everything runs on a free T4. Absolute numbers are not comparable to the paper; only qualitative comparisons are meaningful.
+
+\begin{table}[h]\centering\small\caption{Training configuration (Colab T4, single run, seed 0).}
 \begin{tabular}{lcc}\toprule
  & Selective copy & Char LM\\\midrule
-$d_{\text{model}}$ / layers / $N$ & 32 / 2 / 8 & 32 / 2 / 8\\
-Context & 32+4 & 64\\
-Batch / steps & 32 / 1500 & 32 / 1200\\
-Optimizer & \multicolumn{2}{c}{AdamW, lr $3{\times}10^{-3}$, wd 0.01, one-cycle (10\% warmup)}\\
-Grad clip / seed & \multicolumn{2}{c}{1.0 / 0}\\\bottomrule
-\end{tabular}\end{table}
-\noindent\textbf{Selective copying data.} Each example has $L$ input positions with $K$ data tokens (values in $1..8$) at random sorted positions and noise token 0 elsewhere, followed by $K$ recall markers; the target at the final $K$ positions is the data tokens in order. Loss and accuracy are computed only there; ``sequence accuracy'' requires all $K$ correct. Evaluation uses a fixed held-out generator seed.
-\section{Experiments and Results}
-\textbf{Changes from the paper.} Compute available for this run was a single CPU core, so we scaled down heavily: $d_{\text{model}}=32$, 2 layers, $N=8$, one seed, 1500 steps (copy) / 1200 steps (LM). Selective copying uses sequence length $L=32$ with $K=4$ tokens among noise, vocabulary 8 (the paper uses $L{=}4096$, $K{=}16$); TinyShakespeare uses context 64 with a 90/10 split. Absolute numbers are therefore not comparable to the paper; only the qualitative comparison is.
-
-\begin{table}[h]\centering\small
-\caption{Reduced-scale results (seed 0).}
-\begin{tabular}{llcc}\toprule
-Task & Model & Params & Result\\\midrule
-Copy (seq.\ acc.) & Mamba & 17.2K & \textbf{0.986}\\
- & Mamba-LTI & 14.7K & 0.062\\
- & Transformer (param-matched) & 18.5K & 0.930\\
- & Transformer (4$\times$ MLP) & 33.8K & 0.998\\\midrule
-LM (val bpc $\downarrow$) & Mamba & 18.9K & 2.915\\
- & Mamba-LTI & 16.4K & 2.894\\
- & Transformer (param-matched) & 21.4K & 3.540\\
- & Transformer (4$\times$ MLP) & 35.6K & 3.438\\\bottomrule
+$d_{\text{model}}$ / layers / $N$ & 64 / 2 / 16 & 128 / 4 / 16\\
+Context & 64+8 & 128\\
+Batch / steps & 64 / 3000 & 32 / 4000\\
+Peak lr & $3{\times}10^{-3}$ & $2{\times}10^{-3}$\\
+Optimizer & \multicolumn{2}{c}{AdamW, wd 0.01, one-cycle (10\% warmup), clip 1.0}\\\bottomrule
 \end{tabular}\end{table}
 
-\begin{figure}[h]\centering\includegraphics[width=\columnwidth]{copy_curves.png}\caption{Selective copying: sequence and token accuracy during training.}\end{figure}
+\section{Results}
+\begin{table}[h]\centering\small\caption{Selective copying after 3000 steps ($K{=}8$, $L{=}64$).}
+\begin{tabular}{lcccc}\toprule
+Model & Params & Tok.\ acc. & Seq.\ acc. & Time\\\midrule
+Mamba & 66.1K & 0.976 & 0.822 & 325 s\\
+Mamba-LTI & 55.9K & 0.504 & 0.000 & 325 s\\
+Transformer & 66.1K & 1.000 & 1.000 & 26 s\\\bottomrule
+\end{tabular}\end{table}
+\begin{figure*}[t]\centering\includegraphics[width=0.92\textwidth]{copy_curves.png}\caption{Selective copying ($L{=}64$, $K{=}8$): training loss (log scale), token accuracy and sequence accuracy for the three models.}\end{figure*}
 
+\begin{table}[h]\centering\small\caption{TinyShakespeare after 4000 steps (validation).}
+\begin{tabular}{lcccc}\toprule
+Model & Params & Bits/char & Perplexity & Time\\\midrule
+Mamba & 474.9K & 2.383 & 5.22 & 1585 s\\
+Mamba-LTI & 425.9K & 2.385 & 5.22 & 1577 s\\
+Transformer & 474.6K & 2.514 & 5.71 & 64 s\\\bottomrule
+\end{tabular}\end{table}
+\begin{figure}[h]\centering\includegraphics[width=0.85\columnwidth]{lm_curves.png}\caption{Validation bits/char on TinyShakespeare (lower is better).}\end{figure}
 
-\begin{figure}[h]\centering\includegraphics[width=0.8\columnwidth]{lm_curves.png}\caption{TinyShakespeare validation bits/char (lower is better).}\end{figure}
-\textbf{Reading the results.} Selective copying separates the models cleanly: Mamba solves the task, the LTI ablation stays near chance level for the sequence metric, and attention (which can look up content directly) also solves it, with accuracy increasing with capacity. On the LM task all models are far from converged at 1200 steps and 20K parameters; the Mamba variants beat the Transformers, plausibly because the recurrence supplies a position-aware inductive bias that small attention models must learn from scratch, but we did not test this hypothesis.
+\textbf{Selective copying.} Selection is clearly necessary: the LTI model never reproduces a full sequence (0.0\%) and plateaus around 50\% token accuracy, while the selective model reaches 82.2\%. (The LTI model's partial token accuracy is well above chance, $12.5\%$; we did not investigate what it exploits.) The Transformer, however, solves the task completely, reaching 100\% sequence accuracy by about step 2600, much faster than Mamba. Mamba's sequence accuracy rose from 0.58 at step 2200 to 0.78 at step 2600 and then flattened near 0.82 as the one-cycle learning rate decayed to zero; we do not know whether a longer schedule would close the gap to the Transformer.
+
+\textbf{Language modeling.} The selective and LTI Mamba models are indistinguishable (2.383 vs.\ 2.385 bits/char, perplexity 5.22 for both; the curves cross repeatedly), so we cannot claim that selectivity helps here. Both Mamba variants are about 0.13 bits/char better than the parameter-matched Transformer (2.514), whose validation loss was still decreasing slowly at the end of training. Wall-clock times (Mamba about 12$\times$ slower than the Transformer on copying and 25$\times$ on the LM) reflect our Python-level parallel scan, not the paper's fused kernel, and should not be read as a property of the architectures.
+
 \section{Ablation}
-Removing selectivity (input-independent $\Delta,B,C$) drops copy accuracy from 98.6\% to 6.2\%, consistent with the paper's argument: a time-invariant system applies the same dynamics at every position and cannot decide which tokens to keep. Parameter counts differ slightly (14.7K vs 17.2K) because the LTI variant has no \texttt{x\_proj}; this does not explain a gap of this size but we did not run a size-matched LTI model.
+The ablation removes input dependence of $\Delta$, $B$ and $C$ simultaneously. On selective copying this reduces sequence accuracy from 82.2\% to 0\% and token accuracy from 97.6\% to 50.4\%, consistent with the paper's argument: a time-invariant system applies the same dynamics at every position and cannot choose which tokens to keep. On the LM the same ablation changes bits/char by 0.002, i.e.\ no measurable effect. Caveats: the LTI model has fewer parameters, so the comparison is not size-matched (though a $\sim$15\% difference seems unlikely to explain a gap from 82\% to 0\%); and we did not ablate $\Delta$, $B$ and $C$ separately, which the paper does (finding selective $\Delta$ most important).
 
-
-We also note what the ablation does \emph{not} show: it varies selectivity jointly in $\Delta$, $B$ and $C$. The paper additionally ablates each separately and finds selective $\Delta$ the most important; with our compute we did not repeat this, and doing so (and varying the state size $N$) is the most informative follow-up.
-
-\noindent\textbf{State size.} We also varied the state size $N$ on selective copying (Table~III). Accuracy is not monotone in $N$ ($N{=}1$: 88.9\%, $N{=}4$: 80.1\%, $N{=}8$: 98.6\%). With a single seed and a task with $K{=}4$ tokens, this is most plausibly seed-to-seed variance in optimisation rather than a real effect, so we draw no conclusion about $N$ beyond the fact that even $N{=}1$ per channel suffices for substantial accuracy here, since the $D{\cdot}2$ channels each carry their own state.
-\begin{table}[h]\centering\small\caption{Mamba, selective copy, varying state size $N$.}
-\begin{tabular}{cccc}\toprule $N$ & Params & Token acc. & Seq.\ acc.\\\midrule
-1 & 14.5K & 0.971 & 0.889\\ 4 & 15.6K & 0.945 & 0.801\\ 8 & 17.2K & 0.995 & 0.986\\\bottomrule\end{tabular}\end{table}
 \section{Failure Cases and Caveats}
-(i) On the character LM the LTI ablation was marginally better (2.894 vs 2.915 bpc); with one seed, tiny models and short training this difference is within what we would expect from noise, so we do not claim selectivity helps here. (ii) On copy, Mamba (98.6\%) outperforms the parameter-matched Transformer (93.0\%), but the 4$\times$-MLP Transformer, with twice the parameters, scores highest (99.8\%); on the LM both Mamba variants beat both Transformers. (iii) With one seed we have no confidence intervals. (iv) The sequential/parallel scan is slow in Python, which limited scale. (v) Early in LM training the validation loss was above the uniform-prediction level (about 8.5 bits/char at step 80, during learning-rate warmup with tied embeddings) before falling; we did not investigate the cause.
-
+(i) \emph{Single seed.} All numbers come from one run, so we have no estimate of run-to-run variance; differences such as 0.13 bits/char between Mamba and the Transformer should be treated as tentative. (ii) \emph{Transformer wins at short length.} At $L{=}64$ attention can retrieve content directly and solves selective copying faster and more completely than Mamba; the paper's argument concerns much longer sequences, which we did not test. (iii) \emph{Mamba not converged on copying.} Its accuracy was still improving until the learning rate annealed, so the reported 82.2\% is likely not its ceiling; we did not test longer training. (iv) \emph{Likely overfitting on the LM.} Mamba's validation loss reached 2.364 bits/char at step 1862, was 2.394 at step 2394, and ended at 2.383; the final single-batch training loss was about 1.2--1.3 nats (about 1.8 bits/char), well below validation. Together with the 16 passes over a 1 MB corpus (4000 steps $\times$ 32 $\times$ 128 characters) this suggests overfitting, but we did not test it, e.g.\ with dropout or early stopping. (v) \emph{Not size-matched LTI.} See above. (vi) \emph{Speed.} The scan is pure PyTorch, so no efficiency claims can be made.
 
 \section{Related Work}
-S4 \cite{s4} introduced structured, stable parameterisations of LTI SSMs for long-range modeling. Mamba \cite{gu2023mamba} extends this line with input-dependent parameters and a hardware-aware scan, and reports competitive language modeling with linear scaling in sequence length. The selective-copying task used here follows the paper's synthetic benchmark. Our contribution is only a small-scale re-implementation and ablation, not a new result.
+S4 \cite{s4} introduced stable parameterisations of LTI SSMs for long sequences. Mamba \cite{gu2023mamba} adds input-dependent parameters and a hardware-aware scan and reports competitive language modeling with linear scaling in length. The selective-copying task follows the paper's synthetic benchmark. Our work is a small-scale re-implementation and ablation, not a new result.
+
 \section{Conclusion}
-The central mechanism, input-dependent selection, is clearly necessary for selective copying in our reproduction, while the LM benefit could not be shown at this scale. Colab-scale runs ($L{=}256$, larger models, multiple seeds) are the natural next step.
+At small scale, input-dependent selection is necessary for selective copying (82\% vs.\ 0\% sequence accuracy against an LTI ablation) but a parameter-matched Transformer still solves the task better at $L{=}64$. On TinyShakespeare, selection made no measurable difference, while both Mamba variants outperformed the matched Transformer by about 0.13 bits/char. Next steps are multiple seeds, longer sequences, separate ablations of $\Delta$, $B$ and $C$, and regularisation for the LM.
 
 \begin{thebibliography}{9}\small
 \bibitem{gu2023mamba} A. Gu and T. Dao, ``Mamba: Linear-time sequence modeling with selective state spaces,'' \emph{COLM}, 2024, arXiv:2312.00752.
-\bibitem{s4} A. Gu, K. Goel, C. R\'e, ``Efficiently modeling long sequences with structured state spaces,'' \emph{ICLR}, 2022.
-\bibitem{repo} \texttt{state-spaces/mamba} (official repository), consulted for initialisation conventions only.
+\bibitem{s4} A. Gu, K. Goel, and C. R\'e, ``Efficiently modeling long sequences with structured state spaces,'' \emph{ICLR}, 2022.
 \end{thebibliography}
 \end{document}
